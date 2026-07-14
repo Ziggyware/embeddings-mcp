@@ -1,0 +1,5 @@
+bin/
+model/
+obj/
+embeddings/
+.vs/

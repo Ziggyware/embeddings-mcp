@@ -15,14 +15,11 @@
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
     <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.27.1" />
     <PackageReference Include="Microsoft.ML.Tokenizers" Version="2.0.0" />
+    <PackageReference Include="System.Numerics.Tensors" Version="8.0.0" />
     <PackageReference Include="System.Text.Json" Version="10.0.6" />
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Model/vocab files ship alongside the built binary — matches OnnxEmbedder's
-         AppContext.BaseDirectory-relative default paths from Part 1. If you don't drop
-         a model here, EMBED_MODEL_PATH/EMBED_VOCAB_PATH env vars override this at
-         runtime — this glob is a convenience default, not a hard requirement. -->
     <None Include="model/**" CopyToOutputDirectory="PreserveNewest" Condition="Exists('model')" />
   </ItemGroup>
 

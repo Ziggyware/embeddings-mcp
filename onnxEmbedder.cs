@@ -1,12 +1,8 @@
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using Microsoft.ML.Tokenizers;
+using System.Numerics;
 
-// bge-base-en-v1.5: 768d, mean-pooled (mask-aware), L2-normalized. Query side carries an
-// instruction prefix; passage side does not.
-// [empirical — model card convention; pooling method corrected from CLS to mean per
-// bge-base-en-v1.5-ONNX's own documented usage, still worth re-verifying against your
-// actual downloaded export if results look degenerate]
 internal static class OnnxEmbedder
 {
     public const int Dim = 768;
@@ -17,11 +13,6 @@ internal static class OnnxEmbedder
     static BertTokenizer _tok;
     static bool _initialized;
 
-    // Explicit init, no static ctor. [rule 5 failure mode]: caller MUST call this before
-    // any Embed* call, or Embed* throws a clear InvalidOperationException rather than the
-    // opaque "static ctor already ran with null paths" failure this replaces. Called once
-    // from Program.cs after paths are known (env vars, CLI args, wherever they come from) —
-    // not gated to any one config source, that decision stays outside this file.
     public static void Init(string modelPath, string vocabPath)
     {
         if (_initialized)
@@ -55,16 +46,77 @@ internal static class OnnxEmbedder
     public static float[] EmbedQuery(string text) => EmbedOne(QueryPrefix + text);
     public static float[] EmbedPassage(string text) => EmbedOne(text);
 
-    public static float[][] EmbedPassagesBatch(string[] texts) =>
-        texts.Select(EmbedPassage).ToArray();
-    // Still a per-item loop, not a true batch — same disclosed gap as before, unchanged
-    // by this refactor. [rule 18, restated not re-derived]
+    public static float[][] EmbedPassagesBatch(string[] texts)
+    {
+        EnsureInitialized();
+        int b = texts.Length;
+        if (b == 0) return Array.Empty<float[]>();
+
+        var tokenized = new IReadOnlyList<int>[b];
+        int maxLen = 0;
+        for (int i = 0; i < b; i++)
+        {
+            tokenized[i] = _tok.EncodeToIds(texts[i], MaxSeqLen, addSpecialTokens: true, out _, out _);
+            maxLen = Math.Max(maxLen, tokenized[i].Count);
+        }
+
+        var ids = new long[b * maxLen];
+        var mask = new long[b * maxLen];
+        var types = new long[b * maxLen];
+
+        for (int i = 0; i < b; i++)
+        {
+            var row = tokenized[i];
+            int off = i * maxLen;
+            for (int t = 0; t < row.Count; t++) { ids[off + t] = row[t]; mask[off + t] = 1; }
+        }
+
+        var inputs = new List<NamedOnnxValue>
+        {
+            NamedOnnxValue.CreateFromTensor("input_ids", new DenseTensor<long>(ids, new[] { b, maxLen })),
+            NamedOnnxValue.CreateFromTensor("attention_mask", new DenseTensor<long>(mask, new[] { b, maxLen })),
+            NamedOnnxValue.CreateFromTensor("token_type_ids", new DenseTensor<long>(types, new[] { b, maxLen }))
+        };
+
+        using var results = _session.Run(inputs);
+        var hidden = ((DenseTensor<float>)results.First(r => r.Name == "last_hidden_state").AsTensor<float>()).Buffer.Span;
+
+        var outVecs = new float[b][];
+        int vw = Vector<float>.Count;
+
+        for (int i = 0; i < b; i++)
+        {
+            var pooled = new float[Dim];
+            float maskSum = 0;
+            int rowBase = i * maxLen * Dim;
+            for (int t = 0; t < maxLen; t++)
+            {
+                if (mask[i * maxLen + t] == 0) continue;
+                maskSum += 1;
+                int off = rowBase + t * Dim;
+                int d = 0;
+                for (; d <= Dim - vw; d += vw)
+                    (new Vector<float>(pooled, d) + new Vector<float>(hidden.Slice(off + d, vw))).CopyTo(pooled, d);
+                for (; d < Dim; d++) pooled[d] += hidden[off + d];
+            }
+            if (maskSum > 0)
+            {
+                var vDiv = new Vector<float>(maskSum);
+                int d = 0;
+                for (; d <= Dim - vw; d += vw)
+                    (new Vector<float>(pooled, d) / vDiv).CopyTo(pooled, d);
+                for (; d < Dim; d++) pooled[d] /= maskSum;
+            }
+            Normalize(pooled);
+            outVecs[i] = pooled;
+        }
+        return outVecs;
+    }
 
     static float[] EmbedOne(string text)
     {
         EnsureInitialized();
         var encoding = _tok!.EncodeToIds(text, MaxSeqLen, addSpecialTokens: true, out _, out _);
-        // Silent truncation past MaxSeqLen — unchanged caveat, restated not re-derived.
 
         int n = encoding.Count;
         var inputIds = new long[n];
@@ -82,8 +134,6 @@ internal static class OnnxEmbedder
             NamedOnnxValue.CreateFromTensor("attention_mask", maskTensor),
             NamedOnnxValue.CreateFromTensor("token_type_ids", typeTensor)
         };
-        // Input/output tensor names still [unverified] against your actual downloaded
-        // export — unchanged by this refactor, same remedy as before (InputMetadata.Keys).
 
         using var results = _session!.Run(inputs);
         var lastHidden = results.First(r => r.Name == "last_hidden_state").AsTensor<float>();
@@ -103,7 +153,7 @@ internal static class OnnxEmbedder
         return pooled;
     }
 
-    static void Normalize(float[] v)
+    internal static void Normalize(float[] v)
     {
         double sumSq = 0;
         for (int i = 0; i < v.Length; i++) sumSq += (double)v[i] * v[i];

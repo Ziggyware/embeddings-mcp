@@ -1,23 +1,20 @@
+using System.Numerics.Tensors;
+using System.Collections.Concurrent;
 
-// Exact brute-force cosine search. No HNSW: scoped to <10k vectors per stated design
-// constraint. [rule 5 failure mode]: this file does NOT self-limit or warn if vector
-// count grows past that scope — it will keep working, just with linearly growing
-// per-query latency (O(n·d)), silently. If you later need >10k-100k vectors, this is
-// the file to replace with an ANN structure; nothing else in the design depends on
-// FlatIndex internals beyond the public methods below.
 internal static class FlatIndex
 {
     public sealed record Entry(string Id, float[] Vector, string Text, string Source);
+    public sealed record Hit(string Id, float Score, string Text, string Source);
 
     static readonly Dictionary<string, Entry> ById = new();
-    static readonly ReaderWriterLockSlim Gate = new(); // mirrors Workspace.Gate's role:
-        // writers (Add/Remove) exclusive, readers (Search) concurrent among themselves.
+    static readonly ReaderWriterLockSlim Gate = new();
+
+    const int ParallelThreshold = 2000;
 
     public static void Add(string id, float[] vector, string text, string source)
     {
         if (vector.Length != OnnxEmbedder.Dim)
-            throw new ArgumentException(
-                $"vector dim {vector.Length} != expected {OnnxEmbedder.Dim}");
+            throw new ArgumentException($"vector dim {vector.Length} != expected {OnnxEmbedder.Dim}");
         Gate.EnterWriteLock();
         try { ById[id] = new Entry(id, vector, text, source); }
         finally { Gate.ExitWriteLock(); }
@@ -30,43 +27,76 @@ internal static class FlatIndex
         finally { Gate.ExitWriteLock(); }
     }
 
-    public static int Count { get { Gate.EnterReadLock(); try { return ById.Count; } finally { Gate.ExitReadLock(); } } }
-
-    public sealed record Hit(string Id, float Score, string Text, string Source);
-
-    // topK via full scan + sort. [derived]: O(n log n) dominated by the sort, not the
-    // scan; at n<10k this is sub-millisecond on typical hardware [heuristic, confidence:
-    // low — not benchmarked in this environment, mark [unverified — check before relying
-    // on this] if latency is load-bearing for your use case].
-    public static Hit[] Search(float[] queryVec, int topK)
+    public static Entry Get(string id)
     {
-        if (queryVec.Length != OnnxEmbedder.Dim)
-            throw new ArgumentException(
-                $"query vector dim {queryVec.Length} != expected {OnnxEmbedder.Dim}");
         Gate.EnterReadLock();
-        try
-        {
-            return ById.Values
-                .Select(e => new Hit(e.Id, Dot(queryVec, e.Vector), e.Text, e.Source))
-                .OrderByDescending(h => h.Score)
-                .Take(topK)
-                .ToArray();
-        }
+        try { return ById.TryGetValue(id, out var e) ? e : null; }
         finally { Gate.ExitReadLock(); }
     }
 
-    static float Dot(float[] a, float[] b)
+    public static int Count { get { Gate.EnterReadLock(); try { return ById.Count; } finally { Gate.ExitReadLock(); } } }
+
+    public static Hit[] Search(float[] queryVec, int topK)
     {
-        // Both inputs assumed pre-normalized (embedder guarantees this) — no defensive
-        // renormalization here. [rule 3 assumption surfacing]: if you ever feed this
-        // vectors from a source OTHER than OnnxEmbedder, this silently returns a
-        // meaningless "cosine" for unnormalized inputs. No check enforces normalization.
-        float s = 0;
-        for (int i = 0; i < a.Length; i++) s += a[i] * b[i];
-        return s;
+        if (queryVec.Length != OnnxEmbedder.Dim)
+            throw new ArgumentException($"query vector dim {queryVec.Length} != expected {OnnxEmbedder.Dim}");
+        if (topK <= 0) throw new ArgumentException("topK must be > 0");
+
+        Entry[] snapshot;
+        Gate.EnterReadLock();
+        try { snapshot = ById.Values.ToArray(); }
+        finally { Gate.ExitReadLock(); }
+
+        if (snapshot.Length == 0) return Array.Empty<Hit>();
+        return snapshot.Length >= ParallelThreshold
+            ? SearchParallel(queryVec, snapshot, topK)
+            : SearchSequential(queryVec, snapshot, topK);
     }
 
-    // Snapshot for persistence — IndexStore reads this, doesn't touch Dictionary directly.
+    static Hit[] SearchSequential(float[] q, Entry[] entries, int topK)
+    {
+        var heap = new PriorityQueue<Hit, float>(topK + 1);
+        foreach (var e in entries)
+            Consider(heap, new Hit(e.Id, Dot(q, e.Vector), e.Text, e.Source), topK);
+        return Drain(heap);
+    }
+
+    static Hit[] SearchParallel(float[] q, Entry[] entries, int topK)
+    {
+        var partitionHeaps = new ConcurrentBag<PriorityQueue<Hit, float>>();
+
+        Parallel.For(0, entries.Length,
+            localInit: () => new PriorityQueue<Hit, float>(topK + 1),
+            body: (i, _, localHeap) =>
+            {
+                var e = entries[i];
+                Consider(localHeap, new Hit(e.Id, Dot(q, e.Vector), e.Text, e.Source), topK);
+                return localHeap;
+            },
+            localFinally: partitionHeaps.Add);
+
+        var merged = new PriorityQueue<Hit, float>(topK + 1);
+        foreach (var h in partitionHeaps)
+            while (h.Count > 0) Consider(merged, h.Dequeue(), topK);
+        return Drain(merged);
+    }
+
+    static void Consider(PriorityQueue<Hit, float> heap, Hit h, int topK)
+    {
+        if (heap.Count < topK) heap.Enqueue(h, h.Score);
+        else if (h.Score > heap.Peek().Score) { heap.Dequeue(); heap.Enqueue(h, h.Score); }
+    }
+
+    static Hit[] Drain(PriorityQueue<Hit, float> heap)
+    {
+        var result = new Hit[heap.Count];
+        for (int i = result.Length - 1; i >= 0; i--) result[i] = heap.Dequeue();
+        return result;
+    }
+
+    static float Dot(float[] a, float[] b) =>
+        TensorPrimitives.Dot((ReadOnlySpan<float>)a, b);
+
     public static Entry[] Snapshot()
     {
         Gate.EnterReadLock();
